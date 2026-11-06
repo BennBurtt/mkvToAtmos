@@ -125,6 +125,31 @@ pub fn segment_keyframes(kfs: &[Keyframe], start: u64, end: u64, opt: &BlockOpti
 pub struct AdmDoc {
     pub axml: String,
     pub chna: Vec<ChnaEntry>,
+    /// For each track of the file: the source channel it carries, or None for silence.
+    pub channel_map: Vec<Option<usize>>,
+}
+
+/// The 7.1.2 bed Dolby Atmos masters carry, in Dolby order.
+pub const BED_712: [&str; 10] = ["L", "R", "C", "LFE", "Lss", "Rss", "Lrs", "Rrs", "Lts", "Rts"];
+
+/// Position of a speaker label that is not part of the 7.1.2 bed, used to turn it into a
+/// static object (DAMF/ADM cartesian coordinates).
+pub fn label_position(label: &str) -> [f64; 3] {
+    match label {
+        "Lfh" => [-1.0, 1.0, 1.0],
+        "Rfh" => [1.0, 1.0, 1.0],
+        "Lrh" => [-1.0, -1.0, 1.0],
+        "Rrh" => [1.0, -1.0, 1.0],
+        "Lw" => [-1.0, 0.5, 0.0],
+        "Rw" => [1.0, 0.5, 0.0],
+        "Lc" => [-0.5, 1.0, 0.0],
+        "Rc" => [0.5, 1.0, 0.0],
+        "Cs" => [0.0, -1.0, 0.0],
+        "Tc" => [0.0, 0.0, 1.0],
+        "Tfc" => [0.0, 1.0, 1.0],
+        "Tbc" => [0.0, -1.0, 1.0],
+        _ => [0.0, 1.0, 0.0],
+    }
 }
 
 /// ADM for a full Atmos master segment: beds + objects.
@@ -144,20 +169,17 @@ pub fn build_master(
     let mut defs = String::new();
     let mut uids = String::new();
 
-    // Beds: one bed object referencing a custom DirectSpeakers pack.
-    let beds: Vec<&Element> = elements
-        .iter()
-        .filter(|e| e.kind == Kind::Bed && common_channel(&e.label).is_some())
-        .collect();
+    // Bed: always a full 7.1.2 (the Dolby Renderer accepts no other layout, and an LFE-only
+    // bed is what TrueHD usually carries). Missing bed channels are written as silence.
     let mut content_n = 0x1001u32;
     let mut object_n = 0x1001u32;
     let mut uid_n = 1u32;
-
-    if !beds.is_empty() {
+    let mut channel_map: Vec<Option<usize>> = Vec::new();
+    {
         let pack = "AP_00011001";
         let _ = writeln!(defs, r#"<audioPackFormat audioPackFormatID="{pack}" audioPackFormatName="AtmosCustomPackFormat1" typeLabel="0001" typeDefinition="DirectSpeakers">"#);
-        for b in &beds {
-            let _ = writeln!(defs, "<audioChannelFormatIDRef>AC_000100{:02x}</audioChannelFormatIDRef>", common_channel(&b.label).unwrap());
+        for l in BED_712 {
+            let _ = writeln!(defs, "<audioChannelFormatIDRef>AC_000100{:02x}</audioChannelFormatIDRef>", common_channel(l).unwrap());
         }
         defs.push_str("</audioPackFormat>\n");
 
@@ -169,13 +191,15 @@ pub fn build_master(
         let _ = writeln!(contents, r#"<audioContent audioContentID="{aco}" audioContentName="Bed 1"><audioObjectIDRef>{ao}</audioObjectIDRef></audioContent>"#);
         let _ = writeln!(objects, r#"<audioObject audioObjectID="{ao}" audioObjectName="Bed 1" start="00:00:00.00000" duration="{end_tc}">"#);
         let _ = writeln!(objects, "<audioPackFormatIDRef>{pack}</audioPackFormatIDRef>");
-        for b in &beds {
+        for l in BED_712 {
             let uid = format!("ATU_{uid_n:08x}");
-            let at = format!("AT_000100{:02x}_01", common_channel(&b.label).unwrap());
+            let at = format!("AT_000100{:02x}_01", common_channel(l).unwrap());
             let _ = writeln!(objects, "<audioTrackUIDRef>{uid}</audioTrackUIDRef>");
             let _ = writeln!(uids, r#"<audioTrackUID UID="{uid}" sampleRate="{rate}" bitDepth="24"><audioTrackFormatIDRef>{at}</audioTrackFormatIDRef><audioPackFormatIDRef>{pack}</audioPackFormatIDRef></audioTrackUID>"#);
+            let src = elements.iter().find(|e| e.kind == Kind::Bed && e.label == l).map(|e| e.channel);
+            channel_map.push(src);
             chna.push(ChnaEntry {
-                track_index: (b.channel + 1) as u16,
+                track_index: channel_map.len() as u16,
                 uid,
                 track_ref: at,
                 pack_ref: pack.to_string(),
@@ -188,8 +212,7 @@ pub fn build_master(
     // Objects (and bed channels with an unknown label, rendered as static objects).
     let mut obj_index = 0u32;
     for (e, kfs) in elements.iter().zip(keyframes) {
-        let is_bed = e.kind == Kind::Bed && common_channel(&e.label).is_some();
-        if is_bed {
+        if e.kind == Kind::Bed && BED_712.contains(&e.label.as_str()) {
             continue;
         }
         obj_index += 1;
@@ -213,7 +236,7 @@ pub fn build_master(
         let _ = writeln!(defs, r#"<audioChannelFormat audioChannelFormatID="{ac}" audioChannelFormatName="{name}" typeLabel="0003" typeDefinition="Objects">"#);
 
         let seg = if e.kind == Kind::Bed {
-            vec![Keyframe { sample_pos: 0, pos: [0.0, 1.0, 0.0], gain: 1.0, size: 0.0, ramp: 0 }]
+            vec![Keyframe { sample_pos: 0, pos: label_position(&e.label), gain: 1.0, size: 0.0, ramp: 0 }]
         } else {
             segment_keyframes(kfs, 0, frames, opt)
         };
@@ -246,8 +269,9 @@ pub fn build_master(
         let _ = writeln!(defs, r#"<audioStreamFormat audioStreamFormatID="{as_}" audioStreamFormatName="PCM_{name}" formatLabel="0001" formatDefinition="PCM"><audioChannelFormatIDRef>{ac}</audioChannelFormatIDRef><audioTrackFormatIDRef>{at}</audioTrackFormatIDRef></audioStreamFormat>"#);
         let _ = writeln!(defs, r#"<audioTrackFormat audioTrackFormatID="{at}" audioTrackFormatName="PCM_{name}" formatLabel="0001" formatDefinition="PCM"><audioStreamFormatIDRef>{as_}</audioStreamFormatIDRef></audioTrackFormat>"#);
         let _ = writeln!(uids, r#"<audioTrackUID UID="{uid}" sampleRate="{rate}" bitDepth="24"><audioTrackFormatIDRef>{at}</audioTrackFormatIDRef><audioPackFormatIDRef>{ap}</audioPackFormatIDRef></audioTrackUID>"#);
+        channel_map.push(Some(e.channel));
         chna.push(ChnaEntry {
-            track_index: (e.channel + 1) as u16,
+            track_index: channel_map.len() as u16,
             uid,
             track_ref: at,
             pack_ref: ap,
@@ -255,7 +279,7 @@ pub fn build_master(
     }
 
     let axml = wrap(title, &end_tc, &programme_refs, &contents, &objects, &defs, &uids);
-    AdmDoc { axml, chna }
+    AdmDoc { axml, chna, channel_map }
 }
 
 /// ADM for a 7.1.4 channel-based file (BS.2094 pack AP_00010017, Dolby channel order).
@@ -280,6 +304,7 @@ pub fn build_714(title: &str, frames: u64, rate: u32) -> AdmDoc {
     AdmDoc {
         axml: wrap(title, &end_tc, refs, contents, &objects, "", &uids),
         chna,
+        channel_map: (0..12).map(Some).collect(),
     }
 }
 

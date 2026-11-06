@@ -386,12 +386,7 @@ fn from_master(m: damf::Master, out_dir: &Path, base: &str, chapters: &[mkv::Cha
         opt.min_gap = opt.min_gap.max(frames * nb_obj.max(1) as u64 / 600_000);
         let tag = if nr > 1 { format!(" {}/{}", ri + 1, nr) } else { String::new() };
 
-        let all_beds_known = m.elements.iter().all(|e| e.kind == damf::Kind::Object || adm::common_channel(&e.label).is_some());
-        let adm_ok = nb_obj > 0 || all_beds_known;
-        if o.adm && !adm_ok && ri == 0 {
-            rep.info("pas d'ADM pour cette piste (disposition de canaux non standard) : seul le 7.1.4 est créé");
-        }
-        if o.adm && adm_ok {
+        if o.adm {
             let kfs: Vec<Vec<damf::Keyframe>> = m
                 .keyframes
                 .iter()
@@ -399,16 +394,25 @@ fn from_master(m: damf::Master, out_dir: &Path, base: &str, chapters: &[mkv::Cha
                 .collect();
             let doc = adm::build_master(&r.title, &m.elements, &kfs, frames, rate, &opt);
             let path = out_dir.join(format!("{} - ADM.wav", r.title));
-            let mut w = wav::WavWriter::create(&path, rate, m.elements.len(), frames, &doc.chna, Some(&doc.axml))?;
+            let nout = doc.channel_map.len();
+            let nin = m.elements.len();
+            let mut w = wav::WavWriter::create(&path, rate, nout, frames, &doc.chna, Some(&doc.axml))?;
             let mut rd = damf::CafReader::open(&m.audio, r.start, frames)?;
-            let mut buf = Vec::new();
+            let (mut buf, mut ob) = (Vec::new(), Vec::new());
             let mut done = 0u64;
             loop {
                 let n = rd.read_raw_i32(48000, &mut buf)?;
                 if n == 0 {
                     break;
                 }
-                w.write_i32(&buf)?;
+                ob.clear();
+                ob.reserve(n * nout);
+                for f in 0..n {
+                    for src in &doc.channel_map {
+                        ob.push(src.map(|c| buf[f * nin + c]).unwrap_or(0));
+                    }
+                }
+                w.write_i32(&ob)?;
                 done += n as u64;
                 if done % (48000 * 20) < 48000 {
                     rep.progress("adm", &format!("Écriture ADM{tag}"), done as f64 / frames as f64);
