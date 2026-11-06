@@ -248,22 +248,38 @@ fn convert(o: &Opts, rep: &Report) -> io::Result<()> {
         let _ = fs::remove_dir_all(&dec_dir);
         fs::create_dir_all(&dec_dir)?;
         rep.progress("decode", &format!("Décodage Atmos{tag}"), 0.0);
-        let status = Command::new(&truehdd)
-            .arg("decode")
-            .arg(&thd)
-            .arg("--output-path")
-            .arg(dec_dir.join("master"))
-            .arg("--bed-conform")
-            .arg("--no-estimate-progress")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| err(format!("impossible de lancer truehdd ({}) : {e}", truehdd.display())))?;
-        if !status.status.success() {
-            let msg = String::from_utf8_lossy(&status.stderr);
-            let last: Vec<&str> = msg.lines().rev().take(3).collect();
-            return Err(err(format!("truehdd a échoué : {}", last.into_iter().rev().collect::<Vec<_>>().join(" / "))));
+        // First with --bed-conform (a full 7.1.2 bed, as the Dolby Renderer requires). Streams
+        // where that yields nothing (channel-based Atmos) are decoded again without it.
+        for conform in [true, false] {
+            let _ = fs::remove_dir_all(&dec_dir);
+            fs::create_dir_all(&dec_dir)?;
+            let mut cmd = Command::new(&truehdd);
+            cmd.arg("decode").arg(&thd).arg("--output-path").arg(dec_dir.join("master"));
+            if conform {
+                cmd.arg("--bed-conform");
+            }
+            let status = cmd
+                .arg("--no-estimate-progress")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output()
+                .map_err(|e| err(format!("impossible de lancer truehdd ({}) : {e}", truehdd.display())))?;
+            let produced = fs::read_dir(&dec_dir)?.filter_map(|e| e.ok()).any(|e| {
+                e.path().extension().is_some_and(|x| x == "atmos" || x == "caf" || x == "wav" || x == "audio")
+                    && e.metadata().map(|m| m.len() > 0).unwrap_or(false)
+            });
+            if status.status.success() && produced {
+                break;
+            }
+            if !conform {
+                let msg = String::from_utf8_lossy(&status.stderr);
+                let last: Vec<&str> = msg.lines().rev().take(3).collect();
+                return Err(err(format!(
+                    "truehdd n'a rien produit : {}",
+                    last.into_iter().rev().collect::<Vec<_>>().join(" / ")
+                )));
+            }
         }
         rep.progress("decode", &format!("Décodage Atmos{tag}"), 1.0);
         let _ = fs::remove_file(&thd);
