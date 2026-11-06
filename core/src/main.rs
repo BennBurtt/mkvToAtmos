@@ -151,7 +151,8 @@ fn main() -> ExitCode {
         Some("damf") => parse_args(&args[1..]).and_then(|o| {
             let out = o.out.clone().unwrap_or_else(|| o.input.parent().unwrap_or(Path::new(".")).to_path_buf());
             let base = o.input.file_name().unwrap().to_string_lossy().trim_end_matches(".atmos").to_string();
-            from_damf(&o.input, &out, &base, &[], &o, &rep)
+            rep.info("Lecture du master Atmos");
+            from_master(damf::load(&o.input)?, &out, &base, &[], &o, &rep)
         }),
         Some("tracks") => parse_args(&args[1..]).and_then(|o| list_tracks(&o.input)),
         Some("extract") => parse_args(&args[1..]).and_then(|o| {
@@ -275,21 +276,38 @@ fn convert(o: &Opts, rep: &Report) -> io::Result<()> {
         atmos.sort();
 
         if atmos.is_empty() {
-            // Plain TrueHD (5.1/7.1), no Atmos: hand back the decoded WAV.
-            let wavs: Vec<PathBuf> = fs::read_dir(&dec_dir)?
+            // No object metadata: channel-based Atmos (CBI) or plain 5.1/7.1 TrueHD.
+            let mut files: Vec<PathBuf> = fs::read_dir(&dec_dir)?
                 .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().is_some_and(|x| x == "wav"))
+                .filter(|p| p.extension().is_some_and(|x| x == "caf" || x == "wav" || x == "audio"))
                 .collect();
-            if wavs.is_empty() {
-                return Err(err("truehdd n'a produit aucun fichier"));
+            files.sort();
+            if files.is_empty() {
+                return Err(err("truehdd n'a produit aucun fichier audio"));
             }
-            rep.info("cette piste TrueHD ne contient pas d'Atmos : export en multicanal classique");
-            for (i, w) in wavs.iter().enumerate() {
-                let suffix = if wavs.len() > 1 { format!(" partie {}", i + 1) } else { String::new() };
-                let dst = out_dir.join(format!("{label}{suffix} (TrueHD sans Atmos).w64.wav"));
-                fs::rename(w, &dst).or_else(|_| fs::copy(w, &dst).map(|_| ()))?;
-                rep.file(&dst);
+            for (si, f) in files.iter().enumerate() {
+                let base = if files.len() > 1 { format!("{label} partie {}", si + 1) } else { label.clone() };
+                let is_caf = std::fs::File::open(f)
+                    .and_then(|mut h| {
+                        let mut b = [0u8; 4];
+                        std::io::Read::read_exact(&mut h, &mut b).map(|_| b)
+                    })
+                    .map(|b| &b == b"caff")
+                    .unwrap_or(false);
+                if is_caf {
+                    let m = damf::channel_based(f)?;
+                    let names: Vec<&str> = m.elements.iter().map(|e| e.label.as_str()).collect();
+                    rep.info(&format!("piste sans objets ({} canaux : {}), rendu en 7.1.4", names.len(), names.join(" ")));
+                    let ch = if files.len() == 1 { chapters.as_slice() } else { &[] };
+                    from_master(m, &out_dir, &base, ch, o, rep)?;
+                } else {
+                    rep.info("cette piste TrueHD ne contient pas d'Atmos : export en multicanal classique");
+                    let dst = out_dir.join(format!("{base} (TrueHD sans Atmos).w64.wav"));
+                    fs::rename(f, &dst).or_else(|_| fs::copy(f, &dst).map(|_| ()))?;
+                    rep.file(&dst);
+                }
             }
+            let _ = fs::remove_dir_all(&dec_dir);
             continue;
         }
 
@@ -297,7 +315,8 @@ fn convert(o: &Opts, rep: &Report) -> io::Result<()> {
             let base = if atmos.len() > 1 { format!("{label} partie {}", si + 1) } else { label.clone() };
             // Chapters only make sense on an unspliced stream.
             let ch = if atmos.len() == 1 { chapters.as_slice() } else { &[] };
-            from_damf(a, &out_dir, &base, ch, o, rep)?;
+            rep.info("Lecture du master Atmos");
+            from_master(damf::load(a)?, &out_dir, &base, ch, o, rep)?;
             if o.keep_damf {
                 let ddir = out_dir.join(format!("{base} (DAMF)"));
                 fs::create_dir_all(&ddir)?;
@@ -322,9 +341,7 @@ struct Range {
     end: u64,
 }
 
-fn from_damf(atmos: &Path, out_dir: &Path, base: &str, chapters: &[mkv::Chapter], o: &Opts, rep: &Report) -> io::Result<()> {
-    rep.info("Lecture du master Atmos");
-    let m = damf::load(atmos)?;
+fn from_master(m: damf::Master, out_dir: &Path, base: &str, chapters: &[mkv::Chapter], o: &Opts, rep: &Report) -> io::Result<()> {
     let rate = m.sample_rate;
     let total = m.audio.frames;
     let nb_obj = m.elements.iter().filter(|e| e.kind == damf::Kind::Object).count();
@@ -369,7 +386,12 @@ fn from_damf(atmos: &Path, out_dir: &Path, base: &str, chapters: &[mkv::Chapter]
         opt.min_gap = opt.min_gap.max(frames * nb_obj.max(1) as u64 / 600_000);
         let tag = if nr > 1 { format!(" {}/{}", ri + 1, nr) } else { String::new() };
 
-        if o.adm {
+        let all_beds_known = m.elements.iter().all(|e| e.kind == damf::Kind::Object || adm::common_channel(&e.label).is_some());
+        let adm_ok = nb_obj > 0 || all_beds_known;
+        if o.adm && !adm_ok && ri == 0 {
+            rep.info("pas d'ADM pour cette piste (disposition de canaux non standard) : seul le 7.1.4 est créé");
+        }
+        if o.adm && adm_ok {
             let kfs: Vec<Vec<damf::Keyframe>> = m
                 .keyframes
                 .iter()

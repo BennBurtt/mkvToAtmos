@@ -53,6 +53,91 @@ pub struct CafAudio {
     pub sample_rate: f64,
     pub data_offset: u64,
     pub frames: u64,
+    /// Core Audio channel labels from the `chan` chunk, when it names each channel.
+    pub labels: Vec<u32>,
+}
+
+/// DAMF-style bed label for a Core Audio channel label.
+pub fn label_from_coreaudio(l: u32) -> Option<&'static str> {
+    Some(match l {
+        1 => "L",
+        2 => "R",
+        3 => "C",
+        4 => "LFE",
+        5 | 10 => "Lss",
+        6 | 11 => "Rss",
+        33 => "Lrs",
+        34 => "Rrs",
+        13 => "Lfh",
+        15 => "Rfh",
+        16 => "Lrh",
+        18 => "Rrh",
+        49 => "Lts",
+        51 => "Rts",
+        35 => "Lw",
+        36 => "Rw",
+        37 => "LFE2",
+        9 | 44 => "Cs",
+        12 => "Tc",
+        14 => "Tfc",
+        17 => "Tbc",
+        7 => "Lc",
+        8 => "Rc",
+        _ => return None,
+    })
+}
+
+/// A channel-based "master" (Atmos CBI or plain multichannel) from a decoded CAF.
+pub fn channel_based(caf: &Path) -> io::Result<Master> {
+    let audio = read_caf_header(caf)?;
+    let labels: Vec<String> = if audio.labels.len() == audio.channels {
+        audio
+            .labels
+            .iter()
+            .map(|&l| label_from_coreaudio(l).unwrap_or("?").to_string())
+            .collect()
+    } else {
+        // No per-channel description: assume the usual SMPTE/Dolby orders.
+        let order: &[&str] = match audio.channels {
+            6 => &["L", "R", "C", "LFE", "Lss", "Rss"],
+            8 => &["L", "R", "C", "LFE", "Lss", "Rss", "Lrs", "Rrs"],
+            10 => &["L", "R", "C", "LFE", "Lss", "Rss", "Lrs", "Rrs", "Lts", "Rts"],
+            12 => &["L", "R", "C", "LFE", "Lss", "Rss", "Lrs", "Rrs", "Lfh", "Rfh", "Lrh", "Rrh"],
+            _ => &[],
+        };
+        if order.len() != audio.channels {
+            return Err(bad("disposition des canaux inconnue"));
+        }
+        order.iter().map(|s| s.to_string()).collect()
+    };
+    let elements: Vec<Element> = labels
+        .into_iter()
+        .enumerate()
+        .map(|(i, label)| Element {
+            id: i as u32,
+            kind: Kind::Bed,
+            label,
+            channel: i,
+        })
+        .collect();
+    let keyframes = elements
+        .iter()
+        .map(|_| {
+            vec![Keyframe {
+                sample_pos: 0,
+                pos: [0.0, 1.0, 0.0],
+                gain: 1.0,
+                size: 0.0,
+                ramp: 0,
+            }]
+        })
+        .collect();
+    Ok(Master {
+        elements,
+        keyframes,
+        sample_rate: audio.sample_rate as u32,
+        audio,
+    })
 }
 
 fn bad(msg: &str) -> io::Error {
@@ -334,6 +419,7 @@ pub fn read_caf_header(path: &Path) -> io::Result<CafAudio> {
     }
     let mut pos = 8u64;
     let mut desc: Option<(f64, u32, u32, u32)> = None; // rate, flags, channels, bits
+    let mut labels: Vec<u32> = Vec::new();
     loop {
         let mut ch = [0u8; 12];
         if f.read_exact(&mut ch).is_err() {
@@ -354,6 +440,28 @@ pub fn read_caf_header(path: &Path) -> io::Result<CafAudio> {
                 return Err(bad("CAF non PCM"));
             }
             desc = Some((rate, flags, channels, bits));
+        } else if &kind == b"chan" && size >= 12 {
+            let mut d = vec![0u8; size as usize];
+            f.read_exact(&mut d)?;
+            pos += size as u64;
+            let tag = u32::from_be_bytes(d[0..4].try_into().unwrap());
+            let count = u32::from_be_bytes(d[8..12].try_into().unwrap()) as usize;
+            if tag == 0 {
+                for i in 0..count {
+                    let o = 12 + i * 20;
+                    if o + 4 <= d.len() {
+                        labels.push(u32::from_be_bytes(d[o..o + 4].try_into().unwrap()));
+                    }
+                }
+            } else {
+                labels = match tag {
+                    t if t == (100 << 16) | 1 => vec![3],
+                    t if t == (101 << 16) | 2 => vec![1, 2],
+                    t if t == (121 << 16) | 6 => vec![1, 2, 3, 4, 5, 6],
+                    t if t == (128 << 16) | 8 => vec![1, 2, 3, 4, 5, 6, 33, 34],
+                    _ => Vec::new(),
+                };
+            }
         } else if &kind == b"data" {
             let (rate, flags, channels, bits) = desc.ok_or_else(|| bad("CAF sans desc"))?;
             let data_start = pos + 4; // edit count
@@ -369,6 +477,7 @@ pub fn read_caf_header(path: &Path) -> io::Result<CafAudio> {
                 sample_rate: rate,
                 data_offset: data_start,
                 frames: data_len / frame_bytes,
+                labels,
             });
         } else {
             if size < 0 {

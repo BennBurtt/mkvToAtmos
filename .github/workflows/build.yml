@@ -78,6 +78,7 @@ jobs:
 
       - name: End-to-end test (vrais flux TrueHD Atmos)
         run: |
+          set -o pipefail
           R=MkvToAtmos.app/Contents/Resources
           $R/atmosconv convert tests/atmos_test.mkv --out e2e --truehdd $R/truehdd --keep-damf --json | grep -v '"progress"'
           ls -la e2e
@@ -85,6 +86,7 @@ jobs:
           python3 tests/check_adm.py e2e/*.wav
           $R/atmosconv convert tests/atmos_test.mkv --out e2e_ch --truehdd $R/truehdd --chapters --json | grep -v '"progress"'
           python3 tests/check_adm.py e2e_ch/*.wav
+          test $(ls e2e/*.wav | wc -l) -eq 6
 
       - name: Cross-check with EBU ADM Renderer (informatif)
         continue-on-error: true

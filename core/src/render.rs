@@ -130,6 +130,25 @@ pub fn bed_gains(label: &str) -> [f64; CHANNELS] {
         "Rrh" => g[RTR] = 1.0,
         "Lw" => return object_gains([-1.0, 0.5, 0.0], 0.0),
         "Rw" => return object_gains([1.0, 0.5, 0.0], 0.0),
+        "Lc" => return object_gains([-0.5, 1.0, 0.0], 0.0),
+        "Rc" => return object_gains([0.5, 1.0, 0.0], 0.0),
+        "Cs" => {
+            g[LRS] = h;
+            g[RRS] = h;
+        }
+        "Tfc" => {
+            g[LTF] = h;
+            g[RTF] = h;
+        }
+        "Tbc" => {
+            g[LTR] = h;
+            g[RTR] = h;
+        }
+        "Tc" => {
+            for c in TOP {
+                g[c] = 0.5;
+            }
+        }
         _ => g[C] = 1.0,
     }
     g
