@@ -1,0 +1,92 @@
+name: Build macOS app
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Build atmosconv (universal)
+        working-directory: core
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          lipo -create -output ../atmosconv \
+            target/aarch64-apple-darwin/release/atmosconv \
+            target/x86_64-apple-darwin/release/atmosconv
+
+      - name: Build truehdd (universal)
+        run: |
+          cargo install truehdd --locked --root th-arm --target aarch64-apple-darwin
+          cargo install truehdd --locked --root th-x86 --target x86_64-apple-darwin
+          lipo -create -output truehdd th-arm/bin/truehdd th-x86/bin/truehdd
+          ./truehdd --version
+
+      - name: Build app (universal)
+        run: |
+          swiftc -O -parse-as-library -swift-version 5 -target arm64-apple-macos13 app/MkvToAtmos.swift -o app-arm64
+          swiftc -O -parse-as-library -swift-version 5 -target x86_64-apple-macos13 app/MkvToAtmos.swift -o app-x86_64
+          APP="MkvToAtmos.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          lipo -create -output "$APP/Contents/MacOS/MkvToAtmos" app-arm64 app-x86_64
+          cp app/Info.plist "$APP/Contents/Info.plist"
+          cp atmosconv truehdd "$APP/Contents/Resources/"
+          chmod +x "$APP/Contents/Resources/"*
+
+      - name: Icon
+        run: |
+          mkdir AppIcon.iconset
+          for s in 16 32 64 128 256 512 1024; do
+            sips -s format png -z $s $s app/icon.png --out AppIcon.iconset/tmp_$s.png >/dev/null
+          done
+          cp AppIcon.iconset/tmp_16.png AppIcon.iconset/icon_16x16.png
+          cp AppIcon.iconset/tmp_32.png AppIcon.iconset/icon_16x16@2x.png
+          cp AppIcon.iconset/tmp_32.png AppIcon.iconset/icon_32x32.png
+          cp AppIcon.iconset/tmp_64.png AppIcon.iconset/icon_32x32@2x.png
+          cp AppIcon.iconset/tmp_128.png AppIcon.iconset/icon_128x128.png
+          cp AppIcon.iconset/tmp_256.png AppIcon.iconset/icon_128x128@2x.png
+          cp AppIcon.iconset/tmp_256.png AppIcon.iconset/icon_256x256.png
+          cp AppIcon.iconset/tmp_512.png AppIcon.iconset/icon_256x256@2x.png
+          cp AppIcon.iconset/tmp_512.png AppIcon.iconset/icon_512x512.png
+          cp AppIcon.iconset/tmp_1024.png AppIcon.iconset/icon_512x512@2x.png
+          rm AppIcon.iconset/tmp_*
+          iconutil -c icns AppIcon.iconset -o MkvToAtmos.app/Contents/Resources/AppIcon.icns
+
+      - name: Sign (ad hoc) and zip
+        run: |
+          codesign --force --sign - MkvToAtmos.app/Contents/Resources/atmosconv
+          codesign --force --sign - MkvToAtmos.app/Contents/Resources/truehdd
+          codesign --force --sign - MkvToAtmos.app
+          codesign --verify --verbose MkvToAtmos.app
+          ditto -c -k --keepParent MkvToAtmos.app MkvToAtmos.zip
+
+      - name: Smoke test
+        run: |
+          MkvToAtmos.app/Contents/Resources/atmosconv 2>&1 | grep -q usage
+          MkvToAtmos.app/Contents/Resources/truehdd --help > /dev/null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MkvToAtmos
+          path: MkvToAtmos.zip
+
+      - name: Publish release "latest"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest MkvToAtmos.zip \
+            --title "MkvToAtmos (dernière version)" \
+            --notes "Télécharge MkvToAtmos.zip, dézippe, puis glisse MkvToAtmos dans Applications. Voir le README pour la première ouverture." \
+            --target "${{ github.sha }}"
