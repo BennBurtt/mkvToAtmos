@@ -45,3 +45,5 @@ atmosconv convert album.mkv --chapters
 atmosconv tracks album.mkv          # liste pistes et chapitres
 atmosconv damf master.atmos         # part d'un master DAMF existant
 ```
+
+Le fichier tests/atmos_test.mkv est construit à partir des échantillons de test de truehdd (Apache-2.0).
