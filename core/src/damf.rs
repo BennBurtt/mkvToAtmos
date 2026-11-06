@@ -20,6 +20,8 @@ pub struct Element {
     pub label: String,
     /// Channel index in the audio file.
     pub channel: usize,
+    /// Which bed instance a bed channel belongs to (0 for objects).
+    pub bed_instance: usize,
 }
 
 /// State of an object from `sample_pos` on.
@@ -118,6 +120,7 @@ pub fn channel_based(caf: &Path) -> io::Result<Master> {
             kind: Kind::Bed,
             label,
             channel: i,
+            bed_instance: 0,
         })
         .collect();
     let keyframes = elements
@@ -163,11 +166,24 @@ pub fn load(atmos_path: &Path) -> io::Result<Master> {
     let mut audio_name = None;
     let mut section = "";
     let mut pending_label: Option<String> = None;
-    let mut beds: Vec<(u32, String)> = Vec::new();
+    let mut beds: Vec<(u32, String, usize)> = Vec::new();
+    let mut bed_instance: usize = 0;
+    let mut bed_started = false;
     let mut objects: Vec<u32> = Vec::new();
 
     for raw in text.lines() {
         let line = raw.trim();
+        // A new bed instance starts with "- groupName:", "- description:" or "- channels:"
+        // at the bedInstances list level.
+        if section == "beds" {
+            let indent = raw.len() - raw.trim_start().len();
+            if line.starts_with("- ") && !line.starts_with("- channel:") && indent <= 8 {
+                if bed_started {
+                    bed_instance += 1;
+                }
+                bed_started = true;
+            }
+        }
         let line = line.strip_prefix("- ").unwrap_or(line).trim();
         let Some((key, value)) = line.split_once(':') else {
             continue;
@@ -183,7 +199,7 @@ pub fn load(atmos_path: &Path) -> io::Result<Master> {
             "ID" => {
                 let id: u32 = value.parse().map_err(|_| bad("ID invalide dans .atmos"))?;
                 if section == "beds" {
-                    beds.push((id, pending_label.take().unwrap_or_default()));
+                    beds.push((id, pending_label.take().unwrap_or_default(), bed_instance));
                 } else if section == "objects" {
                     objects.push(id);
                 }
@@ -197,17 +213,19 @@ pub fn load(atmos_path: &Path) -> io::Result<Master> {
 
     let mut elements: Vec<Element> = beds
         .into_iter()
-        .map(|(id, label)| Element {
+        .map(|(id, label, bed_instance)| Element {
             id,
             kind: Kind::Bed,
             label,
             channel: 0,
+            bed_instance,
         })
         .chain(objects.into_iter().map(|id| Element {
             id,
             kind: Kind::Object,
             label: String::new(),
             channel: 0,
+            bed_instance: 0,
         }))
         .collect();
     elements.sort_by_key(|e| e.id);
@@ -290,6 +308,9 @@ fn read_metadata(path: &Path, elements: &[Element]) -> io::Result<(Option<u32>, 
         st: RawState,
     }
     let mut cur: Option<Ev> = None;
+    // Dolby writers omit ID or samplePos when they repeat the previous event's.
+    let mut last_id: Option<u32> = None;
+    let mut last_sp: Option<u64> = None;
 
     let flush = |ev: Ev, state: &mut Vec<RawState>, keyframes: &mut Vec<Vec<Keyframe>>| {
         let (Some(id), Some(sp)) = (ev.id, ev.sample_pos) else {
@@ -354,7 +375,11 @@ fn read_metadata(path: &Path, elements: &[Element]) -> io::Result<(Option<u32>, 
             None => (false, trimmed),
         };
         if is_new {
-            if let Some(ev) = cur.take() {
+            if let Some(mut ev) = cur.take() {
+                ev.id = ev.id.or(last_id);
+                ev.sample_pos = ev.sample_pos.or(last_sp);
+                last_id = ev.id;
+                last_sp = ev.sample_pos;
                 flush(ev, &mut state, &mut keyframes);
             }
             cur = Some(Ev {
@@ -386,7 +411,9 @@ fn read_metadata(path: &Path, elements: &[Element]) -> io::Result<(Option<u32>, 
             _ => {}
         }
     }
-    if let Some(ev) = cur.take() {
+    if let Some(mut ev) = cur.take() {
+        ev.id = ev.id.or(last_id);
+        ev.sample_pos = ev.sample_pos.or(last_sp);
         flush(ev, &mut state, &mut keyframes);
     }
 

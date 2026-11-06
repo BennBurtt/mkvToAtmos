@@ -30,9 +30,16 @@ pub fn common_channel(label: &str) -> Option<u32> {
     })
 }
 
+/// Time in 10 µs units, the resolution of the ADM time format used here.
+pub fn units(samples: u64, rate: u32) -> u64 {
+    (samples as u128 * 100_000 / rate as u128 + if (samples as u128 * 100_000) % rate as u128 * 2 >= rate as u128 { 1 } else { 0 }) as u64
+}
+
 pub fn timecode(samples: u64, rate: u32) -> String {
-    let total = samples as f64 / rate as f64;
-    let mut units = (total * 100_000.0).round() as u64; // 10 µs units
+    tc_units(units(samples, rate))
+}
+
+pub fn tc_units(mut units: u64) -> String {
     let frac = units % 100_000;
     units /= 100_000;
     let s = units % 60;
@@ -169,34 +176,44 @@ pub fn build_master(
     let mut defs = String::new();
     let mut uids = String::new();
 
-    // Bed: always a full 7.1.2 (the Dolby Renderer accepts no other layout, and an LFE-only
-    // bed is what TrueHD usually carries). Missing bed channels are written as silence.
+    // Beds: each bed instance is written as a full 7.1.2 (the Dolby Renderer accepts no
+    // other layout, and an LFE-only bed is what TrueHD usually carries). Missing bed channels
+    // are written as silence.
     let mut content_n = 0x1001u32;
     let mut object_n = 0x1001u32;
     let mut uid_n = 1u32;
     let mut channel_map: Vec<Option<usize>> = Vec::new();
-    {
-        let pack = "AP_00011001";
-        let _ = writeln!(defs, r#"<audioPackFormat audioPackFormatID="{pack}" audioPackFormatName="AtmosCustomPackFormat1" typeLabel="0001" typeDefinition="DirectSpeakers">"#);
-        for l in BED_712 {
-            let _ = writeln!(defs, "<audioChannelFormatIDRef>AC_000100{:02x}</audioChannelFormatIDRef>", common_channel(l).unwrap());
-        }
-        defs.push_str("</audioPackFormat>\n");
-
+    let n_beds = elements
+        .iter()
+        .filter(|e| e.kind == Kind::Bed && BED_712.contains(&e.label.as_str()))
+        .map(|e| e.bed_instance + 1)
+        .max()
+        .unwrap_or(1);
+    let pack = "AP_00011001";
+    let _ = writeln!(defs, r#"<audioPackFormat audioPackFormatID="{pack}" audioPackFormatName="AtmosCustomPackFormat1" typeLabel="0001" typeDefinition="DirectSpeakers">"#);
+    for l in BED_712 {
+        let _ = writeln!(defs, "<audioChannelFormatIDRef>AC_000100{:02x}</audioChannelFormatIDRef>", common_channel(l).unwrap());
+    }
+    defs.push_str("</audioPackFormat>\n");
+    for bi in 0..n_beds {
+        let name = format!("Bed {}", bi + 1);
         let aco = format!("ACO_{content_n:04x}");
         let ao = format!("AO_{object_n:04x}");
         content_n += 1;
         object_n += 1;
         let _ = writeln!(programme_refs, "<audioContentIDRef>{aco}</audioContentIDRef>");
-        let _ = writeln!(contents, r#"<audioContent audioContentID="{aco}" audioContentName="Bed 1"><audioObjectIDRef>{ao}</audioObjectIDRef></audioContent>"#);
-        let _ = writeln!(objects, r#"<audioObject audioObjectID="{ao}" audioObjectName="Bed 1" start="00:00:00.00000" duration="{end_tc}">"#);
+        let _ = writeln!(contents, r#"<audioContent audioContentID="{aco}" audioContentName="{name}"><audioObjectIDRef>{ao}</audioObjectIDRef></audioContent>"#);
+        let _ = writeln!(objects, r#"<audioObject audioObjectID="{ao}" audioObjectName="{name}" start="00:00:00.00000" duration="{end_tc}">"#);
         let _ = writeln!(objects, "<audioPackFormatIDRef>{pack}</audioPackFormatIDRef>");
         for l in BED_712 {
             let uid = format!("ATU_{uid_n:08x}");
             let at = format!("AT_000100{:02x}_01", common_channel(l).unwrap());
             let _ = writeln!(objects, "<audioTrackUIDRef>{uid}</audioTrackUIDRef>");
             let _ = writeln!(uids, r#"<audioTrackUID UID="{uid}" sampleRate="{rate}" bitDepth="24"><audioTrackFormatIDRef>{at}</audioTrackFormatIDRef><audioPackFormatIDRef>{pack}</audioPackFormatIDRef></audioTrackUID>"#);
-            let src = elements.iter().find(|e| e.kind == Kind::Bed && e.label == l).map(|e| e.channel);
+            let src = elements
+                .iter()
+                .find(|e| e.kind == Kind::Bed && e.bed_instance == bi && e.label == l)
+                .map(|e| e.channel);
             channel_map.push(src);
             chna.push(ChnaEntry {
                 track_index: channel_map.len() as u16,
@@ -244,13 +261,18 @@ pub fn build_master(
             let next = seg.get(i + 1).map(|x| x.sample_pos).unwrap_or(frames);
             let dur = next.saturating_sub(k.sample_pos).max(1);
             let interp = (k.ramp as u64).min(dur);
+            // Durations are taken from the rounded start times so blocks tile exactly.
+            let (u0, u1) = (units(k.sample_pos, rate), units(next, rate));
+            if u1 <= u0 {
+                continue;
+            }
             let size = k.size.clamp(0.0, 1.0);
             let _ = write!(
                 defs,
                 r#"<audioBlockFormat audioBlockFormatID="AB_0003{n:04x}_{bi:08x}" rtime="{rt}" duration="{du}"><cartesian>1</cartesian><position coordinate="X">{x:.5}</position><position coordinate="Y">{y:.5}</position><position coordinate="Z">{z:.5}</position>"#,
                 bi = i + 1,
-                rt = timecode(k.sample_pos, rate),
-                du = timecode(dur, rate),
+                rt = tc_units(u0),
+                du = tc_units(u1 - u0),
                 x = k.pos[0].clamp(-1.0, 1.0),
                 y = k.pos[1].clamp(-1.0, 1.0),
                 z = k.pos[2].clamp(-1.0, 1.0),
@@ -262,7 +284,10 @@ pub fn build_master(
                 defs,
                 r#"<gain>{g:.6}</gain><jumpPosition interpolationLength="{il}">1</jumpPosition></audioBlockFormat>"#,
                 g = k.gain,
-                il = format!("{:.5}", interp as f64 / rate as f64),
+                il = {
+                    let iu = units(interp, rate).min(u1 - u0);
+                    format!("{}.{:05}", iu / 100_000, iu % 100_000)
+                },
             );
         }
         defs.push_str("</audioChannelFormat>\n");
