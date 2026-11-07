@@ -31,16 +31,47 @@ struct Opts {
 
 struct Report {
     json: bool,
+    /// Overall progress bookkeeping: total weight of all stages, weight of finished stages,
+    /// weight of the current stage.
+    total: std::cell::Cell<f64>,
+    base: std::cell::Cell<f64>,
+    cur: std::cell::Cell<f64>,
 }
 
 impl Report {
+    fn new(json: bool) -> Self {
+        Self {
+            json,
+            total: std::cell::Cell::new(1.0),
+            base: std::cell::Cell::new(0.0),
+            cur: std::cell::Cell::new(0.0),
+        }
+    }
+
+    /// Starts a stage worth `weight` (in the same units as the total).
+    fn stage(&self, weight: f64, step: &str) {
+        self.base.set(self.base.get() + self.cur.get());
+        self.cur.set(weight);
+        if self.json {
+            println!("{{\"type\":\"step\",\"message\":{}}}", js(step));
+        } else {
+            eprintln!("== {step}");
+        }
+        let _ = io::stdout().flush();
+    }
+
+    fn overall(&self, value: f64) -> f64 {
+        ((self.base.get() + self.cur.get() * value.clamp(0.0, 1.0)) / self.total.get().max(1e-9)).clamp(0.0, 1.0)
+    }
+
     fn progress(&self, phase: &str, label: &str, value: f64) {
         if self.json {
             println!(
-                "{{\"type\":\"progress\",\"phase\":{},\"label\":{},\"value\":{:.4}}}",
+                "{{\"type\":\"progress\",\"phase\":{},\"label\":{},\"value\":{:.4},\"overall\":{:.4}}}",
                 js(phase),
                 js(label),
-                value.clamp(0.0, 1.0)
+                value.clamp(0.0, 1.0),
+                self.overall(value)
             );
         } else {
             eprint!("\r{label} {:5.1}%   ", value * 100.0);
@@ -146,7 +177,7 @@ fn find_truehdd(given: &Option<PathBuf>) -> io::Result<PathBuf> {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let json = args.iter().any(|a| a == "--json");
-    let rep = Report { json };
+    let rep = Report::new(json);
     let result = match args.first().map(String::as_str) {
         Some("convert") => parse_args(&args[1..]).and_then(|o| convert(&o, &rep)),
         Some("damf") => parse_args(&args[1..]).and_then(|o| {
@@ -215,6 +246,10 @@ fn convert(o: &Opts, rep: &Report) -> io::Result<()> {
     let truehdd = find_truehdd(&o.truehdd)?;
 
     rep.info(&format!("{} piste(s) TrueHD trouvée(s)", tracks.len()));
+    // Relative cost of each stage, per track (decoding dominates).
+    let per_track = W_EXTRACT + W_DECODE + if o.adm { W_ADM } else { 0.0 } + if o.r714 { W_714 } else { 0.0 };
+    rep.total.set(per_track * tracks.len() as f64);
+    let est_frames = info.duration_ns.map(|d| (d as u128 * 48_000 / 1_000_000_000) as u64);
     let chapters: Vec<mkv::Chapter> = if o.chapters { info.chapters.clone() } else { Vec::new() };
     if o.chapters && chapters.is_empty() {
         rep.info("pas de chapitres dans ce MKV : le fichier sera converti en entier");
@@ -232,6 +267,7 @@ fn convert(o: &Opts, rep: &Report) -> io::Result<()> {
         let tag = if n > 1 { format!(" ({}/{})", ti + 1, n) } else { String::new() };
 
         // 1. Extract
+        rep.stage(W_EXTRACT, &format!("Extraction de la piste TrueHD {}{tag} ({})", t.number, if t.name.is_empty() { "sans nom" } else { &t.name }));
         let thd = work.join(format!("piste{}.thd", t.number));
         {
             let mut w = BufWriter::with_capacity(1 << 20, File::create(&thd)?);
@@ -242,44 +278,57 @@ fn convert(o: &Opts, rep: &Report) -> io::Result<()> {
             if bytes == 0 {
                 return Err(err("la piste TrueHD est vide"));
             }
+            rep.info(&format!("piste extraite : {:.1} Mo", bytes as f64 / 1e6));
         }
 
         // 2. Decode with truehdd
         let dec_dir = work.join(format!("piste{}", t.number));
         let _ = fs::remove_dir_all(&dec_dir);
         fs::create_dir_all(&dec_dir)?;
+        rep.stage(W_DECODE, &format!("Décodage Atmos avec truehdd{tag}"));
         rep.progress("decode", &format!("Décodage Atmos{tag}"), 0.0);
         // First with --bed-conform (a full 7.1.2 bed, as the Dolby Renderer requires). Streams
         // where that yields nothing (channel-based Atmos) are decoded again without it.
         for conform in [true, false] {
             let _ = fs::remove_dir_all(&dec_dir);
             fs::create_dir_all(&dec_dir)?;
+            rep.info(if conform { "truehdd decode --bed-conform" } else { "nouvel essai : truehdd decode sans --bed-conform" });
+            let log_path = work.join(format!("truehdd_piste{}.log", t.number));
             let mut cmd = Command::new(&truehdd);
             cmd.arg("decode").arg(&thd).arg("--output-path").arg(dec_dir.join("master"));
             if conform {
                 cmd.arg("--bed-conform");
             }
-            let status = cmd
+            let mut child = cmd
                 .arg("--no-estimate-progress")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .output()
+                .stderr(Stdio::from(File::create(&log_path)?))
+                .spawn()
                 .map_err(|e| err(format!("impossible de lancer truehdd ({}) : {e}", truehdd.display())))?;
+            // truehdd gives no progress we can read: follow the size of the audio it writes.
+            let status = loop {
+                if let Some(st) = child.try_wait()? {
+                    break st;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if let Some(frac) = decode_fraction(&dec_dir, est_frames) {
+                    rep.progress("decode", &format!("Décodage Atmos{tag}"), frac.min(0.99));
+                }
+            };
+            let stderr = fs::read_to_string(&log_path).unwrap_or_default();
+            let tail: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).rev().take(4).collect();
+            let tail = tail.into_iter().rev().collect::<Vec<_>>().join(" / ");
             let produced = fs::read_dir(&dec_dir)?.filter_map(|e| e.ok()).any(|e| {
                 e.path().extension().is_some_and(|x| x == "atmos" || x == "caf" || x == "wav" || x == "audio")
                     && e.metadata().map(|m| m.len() > 0).unwrap_or(false)
             });
-            if status.status.success() && produced {
+            if status.success() && produced {
                 break;
             }
+            rep.info(&format!("truehdd ({}) : rien d'utilisable produit. Messages : {}", status, if tail.is_empty() { "aucun" } else { &tail }));
             if !conform {
-                let msg = String::from_utf8_lossy(&status.stderr);
-                let last: Vec<&str> = msg.lines().rev().take(3).collect();
-                return Err(err(format!(
-                    "truehdd n'a rien produit : {}",
-                    last.into_iter().rev().collect::<Vec<_>>().join(" / ")
-                )));
+                return Err(err(format!("truehdd n'a rien produit : {tail}")));
             }
         }
         rep.progress("decode", &format!("Décodage Atmos{tag}"), 1.0);
@@ -351,6 +400,24 @@ fn convert(o: &Opts, rep: &Report) -> io::Result<()> {
     Ok(())
 }
 
+const W_EXTRACT: f64 = 1.0;
+const W_DECODE: f64 = 6.0;
+const W_ADM: f64 = 1.5;
+const W_714: f64 = 2.5;
+
+/// Share of the decode done, from the size of the audio file truehdd is writing.
+fn decode_fraction(dir: &Path, est_frames: Option<u64>) -> Option<f64> {
+    let est = est_frames?;
+    let f = fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "audio" || x == "caf"))?;
+    let size = fs::metadata(&f).ok()?.len();
+    let h = damf::read_caf_header(&f).ok()?;
+    let bytes_per_frame = (h.channels as u64 * (h.bits as u64 / 8)).max(1);
+    Some((size.saturating_sub(h.data_offset) / bytes_per_frame) as f64 / est.max(1) as f64)
+}
+
 struct Range {
     title: String,
     start: u64,
@@ -403,6 +470,7 @@ fn from_master(m: damf::Master, out_dir: &Path, base: &str, chapters: &[mkv::Cha
         let tag = if nr > 1 { format!(" {}/{}", ri + 1, nr) } else { String::new() };
 
         if o.adm {
+            rep.stage(W_ADM * frames as f64 / total.max(1) as f64, &format!("Écriture de l'ADM BWF : {}", r.title));
             let kfs: Vec<Vec<damf::Keyframe>> = m
                 .keyframes
                 .iter()
@@ -430,7 +498,7 @@ fn from_master(m: damf::Master, out_dir: &Path, base: &str, chapters: &[mkv::Cha
                 }
                 w.write_i32(&ob)?;
                 done += n as u64;
-                if done % (48000 * 20) < 48000 {
+                {
                     rep.progress("adm", &format!("Écriture ADM{tag}"), done as f64 / frames as f64);
                 }
             }
@@ -440,6 +508,7 @@ fn from_master(m: damf::Master, out_dir: &Path, base: &str, chapters: &[mkv::Cha
         }
 
         if o.r714 {
+            rep.stage(W_714 * frames as f64 / total.max(1) as f64, &format!("Rendu 7.1.4 : {}", r.title));
             let path = out_dir.join(format!("{} - 7.1.4.wav", r.title));
             let doc = adm::build_714(&r.title, frames, rate);
             let mut w = wav::WavWriter::create(&path, rate, render::CHANNELS, frames, &doc.chna, Some(&doc.axml), None)?;
@@ -461,7 +530,7 @@ fn from_master(m: damf::Master, out_dir: &Path, base: &str, chapters: &[mkv::Cha
                 clipped += wav::to_i24(&outb, &mut ib);
                 w.write_i32(&ib)?;
                 done += n as u64;
-                if done % (48000 * 10) < 48000 {
+                {
                     rep.progress("render", &format!("Rendu 7.1.4{tag}"), done as f64 / frames as f64);
                 }
             }

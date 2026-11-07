@@ -20,7 +20,43 @@ final class Job: ObservableObject, Identifiable {
     @Published var progress: Double = 0
     @Published var outputs: [URL] = []
     @Published var notes: [String] = []
+    @Published var overall: Double = 0
+    @Published var remaining: String = ""
+    @Published var log: [String] = []
     var outputDir: URL?
+    var startedAt: Date?
+    private var smoothedTotal: Double?
+
+    func addLog(_ line: String) {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        log.append("\(f.string(from: Date()))  \(line)")
+    }
+
+    /// Updates the remaining-time estimate from overall progress (smoothed).
+    func updateEstimate() {
+        guard let start = startedAt, overall > 0.01 else { remaining = "estimation en cours…"; return }
+        let elapsed = Date().timeIntervalSince(start)
+        guard elapsed > 3 else { remaining = "estimation en cours…"; return }
+        let total = elapsed / overall
+        smoothedTotal = smoothedTotal.map { $0 * 0.85 + total * 0.15 } ?? total
+        let left = max(0, (smoothedTotal ?? total) - elapsed)
+        remaining = "environ " + Job.duration(left) + " restantes"
+    }
+
+    static func duration(_ t: TimeInterval) -> String {
+        let s = Int(t.rounded())
+        if s < 60 { return "\(max(s, 1)) s" }
+        if s < 3600 { return "\(s / 60) min \(String(format: "%02d", s % 60)) s" }
+        return "\(s / 3600) h \(String(format: "%02d", (s % 3600) / 60)) min"
+    }
+
+    func saveLog() {
+        guard let dir = outputDir else { return }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let text = log.joined(separator: "\n") + "\n"
+        try? text.write(to: dir.appendingPathComponent("journal.txt"), atomically: true, encoding: .utf8)
+    }
 
     init(input: URL) { self.input = input }
 }
@@ -73,6 +109,8 @@ final class Converter: ObservableObject {
         busy = true
         job.state = .running
         job.step = "Démarrage"
+        job.startedAt = Date()
+        job.addLog("Fichier : \(job.input.path)")
 
         let outDir = job.input.deletingLastPathComponent()
             .appendingPathComponent(job.input.deletingPathExtension().lastPathComponent + " - Atmos")
@@ -87,10 +125,27 @@ final class Converter: ObservableObject {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: atmosconv)
         p.arguments = args
+        job.addLog("Options : " + args.dropFirst(2).filter { $0.hasPrefix("--") && $0 != "--json" && $0 != "--truehdd" && $0 != "--out" }.joined(separator: " "))
         let out = Pipe()
+        let err = Pipe()
         p.standardOutput = out
-        p.standardError = Pipe()
+        p.standardError = err
         process = p
+        err.fileHandleForReading.readabilityHandler = { h in
+            let d = h.availableData
+            if d.isEmpty { return }
+            if let t = String(data: d, encoding: .utf8) {
+                DispatchQueue.main.async {
+                    for l in t.split(separator: "\n") where !l.trimmingCharacters(in: .whitespaces).isEmpty {
+                        job.addLog("[stderr] " + l)
+                    }
+                }
+            }
+        }
+        // Keeps the remaining time moving between progress messages.
+        let ticker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
+            if job.state == .running { job.updateEstimate() }
+        }
 
         var buffer = Data()
         out.fileHandleForReading.readabilityHandler = { [weak self] h in
@@ -107,7 +162,9 @@ final class Converter: ObservableObject {
         }
         p.terminationHandler = { [weak self] proc in
             out.fileHandleForReading.readabilityHandler = nil
+            err.fileHandleForReading.readabilityHandler = nil
             DispatchQueue.main.async {
+                ticker.invalidate()
                 guard let self else { return }
                 if case .failed = job.state {
                 } else if proc.terminationReason == .uncaughtSignal {
@@ -116,9 +173,17 @@ final class Converter: ObservableObject {
                     job.state = .done
                     job.step = "Terminé"
                     job.progress = 1
+                    job.overall = 1
                 } else {
-                    job.state = .failed("La conversion a échoué (code \(proc.terminationStatus)).")
+                    job.state = .failed("La conversion s'est arrêtée (code \(proc.terminationStatus)). Le journal est enregistré dans le dossier de sortie.")
                 }
+                let took = Job.duration(Date().timeIntervalSince(job.startedAt ?? Date()))
+                switch job.state {
+                case .done: job.addLog("Terminé en \(took)")
+                case .failed(let m): job.addLog("ÉCHEC : \(m)")
+                default: break
+                }
+                job.saveLog()
                 self.busy = false
                 self.process = nil
                 self.runNext()
@@ -127,7 +192,9 @@ final class Converter: ObservableObject {
         do {
             try p.run()
         } catch {
+            ticker.invalidate()
             job.state = .failed("Impossible de lancer la conversion : \(error.localizedDescription)")
+            job.addLog("ÉCHEC : \(error.localizedDescription)")
             busy = false
             process = nil
             runNext()
@@ -139,12 +206,24 @@ final class Converter: ObservableObject {
         case "progress":
             job.step = obj["label"] as? String ?? job.step
             job.progress = obj["value"] as? Double ?? job.progress
+            if let o = obj["overall"] as? Double { job.overall = max(job.overall, o) }
+            job.updateEstimate()
+        case "step":
+            if let m = obj["message"] as? String { job.addLog("▶︎ " + m) }
         case "info":
-            if let m = obj["message"] as? String { job.notes.append(m) }
+            if let m = obj["message"] as? String {
+                job.addLog(m)
+                if m.hasPrefix("attention") || m.contains("objets") { job.notes.append(m) }
+            }
         case "file":
-            if let p = obj["path"] as? String { job.outputs.append(URL(fileURLWithPath: p)) }
+            if let p = obj["path"] as? String {
+                job.outputs.append(URL(fileURLWithPath: p))
+                job.addLog("Fichier créé : " + URL(fileURLWithPath: p).lastPathComponent)
+            }
         case "error":
-            job.state = .failed(obj["message"] as? String ?? "Erreur inconnue")
+            let m = obj["message"] as? String ?? "Erreur inconnue"
+            job.state = .failed(m)
+            job.addLog("ERREUR : " + m)
         default:
             break
         }
@@ -214,8 +293,16 @@ struct JobRow: View {
                 }
             }
             switch job.state {
-            case .running, .waiting:
-                ProgressView(value: job.progress) { Text(job.step).font(.caption) }
+            case .waiting:
+                Text("En attente").font(.caption).foregroundColor(.secondary)
+            case .running:
+                ProgressView(value: job.overall)
+                HStack {
+                    Text("\(Int((job.overall * 100).rounded())) %").font(.caption.monospacedDigit().bold())
+                    Text(job.step).font(.caption).foregroundColor(.secondary).lineLimit(1)
+                    Spacer()
+                    Text(job.remaining).font(.caption.monospacedDigit()).foregroundColor(.secondary)
+                }
             case .done:
                 Text("\(job.outputs.count) fichier(s) créé(s) dans « \(job.outputDir?.lastPathComponent ?? "") »")
                     .font(.caption).foregroundColor(.secondary)
@@ -225,6 +312,7 @@ struct JobRow: View {
             ForEach(Array(job.notes.enumerated()), id: \.offset) { _, n in
                 Text(n).font(.caption2).foregroundColor(n.hasPrefix("attention") ? .orange : .secondary)
             }
+            LogView(job: job)
         }
         .padding(.vertical, 4)
     }
@@ -235,6 +323,48 @@ struct JobRow: View {
         case .running: Image(systemName: "gearshape.2").foregroundColor(.accentColor)
         case .done: Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
         case .failed: Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.red)
+        }
+    }
+}
+
+struct LogView: View {
+    @ObservedObject var job: Job
+    @State private var open = false
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $open) {
+            VStack(alignment: .trailing, spacing: 4) {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 1) {
+                            ForEach(Array(job.log.enumerated()), id: \.offset) { i, line in
+                                Text(line)
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundColor(line.contains("ERREUR") || line.contains("ÉCHEC") ? .red : .primary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .id(i)
+                            }
+                        }
+                        .textSelection(.enabled)
+                        .padding(6)
+                    }
+                    .frame(height: 140)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .textBackgroundColor)))
+                    .onChange(of: job.log.count) { n in
+                        withAnimation { proxy.scrollTo(n - 1, anchor: .bottom) }
+                    }
+                }
+                Button("Copier le journal") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(job.log.joined(separator: "\n"), forType: .string)
+                }
+                .font(.caption)
+            }
+        } label: {
+            Text("Journal (\(job.log.count) lignes)").font(.caption)
+        }
+        .onChange(of: job.state) { st in
+            if case .failed = st { open = true }
         }
     }
 }
