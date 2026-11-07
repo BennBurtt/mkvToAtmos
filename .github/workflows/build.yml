@@ -88,13 +88,15 @@ jobs:
           python3 tests/check_adm.py e2e_ch/*.wav
           test $(ls e2e/*.wav | wc -l) -eq 6
 
+      # EAR refuse les ADM au format Dolby (audioStreamFormat avec référence de pack), y compris
+      # ceux écrits par le Dolby Atmos Renderer : cette étape reste informative.
       - name: Cross-check with EBU ADM Renderer (informatif)
         continue-on-error: true
         run: |
           python3 -m venv earenv
           earenv/bin/pip install -q numpy scipy "attrs<22" ruamel.yaml lxml six multipledispatch "setuptools<70"
           earenv/bin/pip install -q --no-deps ear
-          for f in e2e/*ADM.wav; do earenv/bin/ear-render --strict -s 4+7+0 "$f" "/tmp/$(basename "$f").ear.wav" && echo "EAR OK: $f"; done
+          for f in e2e/*ADM.wav; do earenv/bin/ear-render -s 4+7+0 "$f" "/tmp/$(basename "$f").ear.wav" && echo "EAR OK: $f"; done
 
       - uses: actions/upload-artifact@v4
         with:

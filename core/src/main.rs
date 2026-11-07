@@ -8,6 +8,7 @@
 
 mod adm;
 mod damf;
+mod dbmd_template;
 mod mkv;
 mod render;
 mod wav;
@@ -411,7 +412,7 @@ fn from_master(m: damf::Master, out_dir: &Path, base: &str, chapters: &[mkv::Cha
             let path = out_dir.join(format!("{} - ADM.wav", r.title));
             let nout = doc.channel_map.len();
             let nin = m.elements.len();
-            let mut w = wav::WavWriter::create(&path, rate, nout, frames, &doc.chna, Some(&doc.axml))?;
+            let mut w = wav::WavWriter::create(&path, rate, nout, frames, &doc.chna, Some(&doc.axml), doc.dbmd.as_deref())?;
             let mut rd = damf::CafReader::open(&m.audio, r.start, frames)?;
             let (mut buf, mut ob) = (Vec::new(), Vec::new());
             let mut done = 0u64;
@@ -441,7 +442,7 @@ fn from_master(m: damf::Master, out_dir: &Path, base: &str, chapters: &[mkv::Cha
         if o.r714 {
             let path = out_dir.join(format!("{} - 7.1.4.wav", r.title));
             let doc = adm::build_714(&r.title, frames, rate);
-            let mut w = wav::WavWriter::create(&path, rate, render::CHANNELS, frames, &doc.chna, Some(&doc.axml))?;
+            let mut w = wav::WavWriter::create(&path, rate, render::CHANNELS, frames, &doc.chna, Some(&doc.axml), None)?;
             let mut rd = damf::CafReader::open(&m.audio, r.start, frames)?;
             let mut ren = render::Renderer::new(&m.elements, &m.keyframes);
             let (mut inb, mut outb, mut ib) = (Vec::new(), Vec::new(), Vec::new());

@@ -15,6 +15,8 @@ pub struct ChnaEntry {
 
 pub struct WavWriter {
     w: BufWriter<File>,
+    /// Chunks written after the audio (axml, chna, dbmd), as the Dolby Atmos Renderer does.
+    tail: Vec<u8>,
     channels: usize,
     expected_frames: u64,
     written_frames: u64,
@@ -46,6 +48,7 @@ impl WavWriter {
         frames: u64,
         chna: &[ChnaEntry],
         axml: Option<&str>,
+        dbmd: Option<&[u8]>,
     ) -> io::Result<Self> {
         let block_align = channels * 3;
         let data_size = frames * block_align as u64;
@@ -61,6 +64,10 @@ impl WavWriter {
         fmt.extend_from_slice(&24u16.to_le_bytes());
         chunk(&mut chunks, b"fmt ", &fmt);
 
+        let mut tail = Vec::new();
+        if let Some(x) = axml {
+            chunk(&mut tail, b"axml", x.as_bytes());
+        }
         if !chna.is_empty() {
             let mut c = Vec::new();
             let uids = chna.len() as u16;
@@ -73,14 +80,14 @@ impl WavWriter {
                 c.extend(fixed(&e.pack_ref, 11));
                 c.push(0);
             }
-            chunk(&mut chunks, b"chna", &c);
+            chunk(&mut tail, b"chna", &c);
         }
-        if let Some(x) = axml {
-            chunk(&mut chunks, b"axml", x.as_bytes());
+        if let Some(d) = dbmd {
+            chunk(&mut tail, b"dbmd", d);
         }
 
         // 4 ("WAVE") + 36 (ds64/JUNK) + chunks + 8 (data header) + data
-        let riff_size = 4 + 36 + chunks.len() as u64 + 8 + data_size + (data_size % 2);
+        let riff_size = 4 + 36 + chunks.len() as u64 + 8 + data_size + (data_size % 2) + tail.len() as u64;
         let big = riff_size > u32::MAX as u64 - 1024 || std::env::var_os("ATMOSCONV_FORCE_BW64").is_some();
 
         let mut head = Vec::new();
@@ -108,6 +115,7 @@ impl WavWriter {
         w.write_all(&head)?;
         Ok(Self {
             w,
+            tail,
             channels,
             expected_frames: frames,
             written_frames: 0,
@@ -144,6 +152,8 @@ impl WavWriter {
         if data_size % 2 == 1 {
             self.w.write_all(&[0])?;
         }
+        let tail = std::mem::take(&mut self.tail);
+        self.w.write_all(&tail)?;
         self.w.flush()
     }
 }
