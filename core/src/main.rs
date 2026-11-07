@@ -8,6 +8,7 @@
 
 mod adm;
 mod damf;
+mod damf_split;
 mod dbmd_template;
 mod mkv;
 mod render;
@@ -385,13 +386,45 @@ fn convert(o: &Opts, rep: &Report) -> io::Result<()> {
             if o.keep_damf {
                 let ddir = out_dir.join(format!("{base} (DAMF)"));
                 fs::create_dir_all(&ddir)?;
-                let stemname = a.file_name().unwrap().to_string_lossy().to_string();
-                for ext in ["", ".metadata", ".audio"] {
-                    let src = PathBuf::from(format!("{}{ext}", a.display()));
-                    let dst = ddir.join(format!("{stemname}{ext}"));
-                    fs::rename(&src, &dst).or_else(|_| fs::copy(&src, &dst).map(|_| ()))?;
+                let audio = PathBuf::from(format!("{}.audio", a.display()));
+                let h = damf::read_caf_header(&audio)?;
+                let ranges = compute_ranges(ch, &base, h.sample_rate as u32, h.frames);
+                if ranges.len() > 1 {
+                    rep.stage(0.0, &format!("Découpage du master DAMF en {} morceaux", ranges.len()));
+                    let parts: Vec<damf_split::Part> = ranges
+                        .iter()
+                        .map(|r| damf_split::Part { name: r.title.clone(), start: r.start, end: r.end })
+                        .collect();
+                    for f in damf_split::split(a, &parts, &ddir, &mut |v| rep.progress("damf", "Découpage DAMF", v))? {
+                        rep.file(&f);
+                    }
+                } else {
+                    // Whole master: move the files, renamed after the album.
+                    let text = fs::read_to_string(a)?
+                        .lines()
+                        .map(|l| {
+                            let t = l.trim_start();
+                            let ind = &l[..l.len() - t.len()];
+                            if t.starts_with("metadata:") {
+                                format!("{ind}metadata: {base}.atmos.metadata")
+                            } else if t.starts_with("audio:") {
+                                format!("{ind}audio: {base}.atmos.audio")
+                            } else {
+                                l.to_string()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        + "\n";
+                    let dst = ddir.join(format!("{base}.atmos"));
+                    fs::write(&dst, text)?;
+                    for ext in [".metadata", ".audio"] {
+                        let src = PathBuf::from(format!("{}{ext}", a.display()));
+                        let to = ddir.join(format!("{base}.atmos{ext}"));
+                        fs::rename(&src, &to).or_else(|_| fs::copy(&src, &to).map(|_| ()))?;
+                    }
+                    rep.file(&dst);
                 }
-                rep.file(&ddir);
             }
         }
         let _ = fs::remove_dir_all(&dec_dir);
@@ -418,6 +451,28 @@ fn decode_fraction(dir: &Path, est_frames: Option<u64>) -> Option<f64> {
     Some((size.saturating_sub(h.data_offset) / bytes_per_frame) as f64 / est.max(1) as f64)
 }
 
+fn compute_ranges(chapters: &[mkv::Chapter], base: &str, rate: u32, total: u64) -> Vec<Range> {
+    let mut ranges = Vec::new();
+    for (i, c) in chapters.iter().enumerate() {
+        let s = (c.start_ns as u128 * rate as u128 / 1_000_000_000) as u64;
+        let e = chapters
+            .get(i + 1)
+            .map(|n| (n.start_ns as u128 * rate as u128 / 1_000_000_000) as u64)
+            .or(c.end_ns.map(|e| (e as u128 * rate as u128 / 1_000_000_000) as u64))
+            .unwrap_or(total)
+            .min(total);
+        if e <= s + rate as u64 / 10 {
+            continue;
+        }
+        let name = if c.title.trim().is_empty() { format!("Chapitre {}", i + 1) } else { sanitize(&c.title) };
+        ranges.push(Range { title: format!("{base} - {:02} {name}", i + 1), start: s, end: e });
+    }
+    if ranges.is_empty() {
+        ranges.push(Range { title: base.to_string(), start: 0, end: total });
+    }
+    ranges
+}
+
 struct Range {
     title: String,
     start: u64,
@@ -438,28 +493,7 @@ fn from_master(m: damf::Master, out_dir: &Path, base: &str, chapters: &[mkv::Cha
     ));
     fs::create_dir_all(out_dir)?;
 
-    let mut ranges = Vec::new();
-    if chapters.is_empty() {
-        ranges.push(Range { title: base.to_string(), start: 0, end: total });
-    } else {
-        for (i, c) in chapters.iter().enumerate() {
-            let s = (c.start_ns as u128 * rate as u128 / 1_000_000_000) as u64;
-            let e = chapters
-                .get(i + 1)
-                .map(|n| (n.start_ns as u128 * rate as u128 / 1_000_000_000) as u64)
-                .or(c.end_ns.map(|e| (e as u128 * rate as u128 / 1_000_000_000) as u64))
-                .unwrap_or(total)
-                .min(total);
-            if e <= s + rate as u64 / 10 {
-                continue;
-            }
-            let name = if c.title.trim().is_empty() { format!("Chapitre {}", i + 1) } else { sanitize(&c.title) };
-            ranges.push(Range { title: format!("{base} - {:02} {name}", i + 1), start: s, end: e });
-        }
-        if ranges.is_empty() {
-            ranges.push(Range { title: base.to_string(), start: 0, end: total });
-        }
-    }
+    let ranges = compute_ranges(chapters, base, rate, total);
 
     let nr = ranges.len();
     for (ri, r) in ranges.iter().enumerate() {

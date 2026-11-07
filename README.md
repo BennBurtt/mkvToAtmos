@@ -5,7 +5,11 @@ Petite appli Mac : on glisse un MKV qui contient de l'Atmos **Dolby TrueHD** (lo
 - un **ADM BWF** (`… - ADM.wav`) : le master Atmos avec ses objets et leurs mouvements. Il se lit dans le standalone **Virtuoso**, s'importe dans **Pro Tools** (Import Session Data) et s'ouvre dans le **Dolby Atmos Renderer** ;
 - un **WAV 7.1.4** (`… - 7.1.4.wav`) : un rendu en 12 canaux qui se lit partout (Virtuoso, Pro Tools, Reaper…). Ordre des canaux : L R C LFE Lss Rss Lrs Rrs Ltf Rtf Ltr Rtr.
 
-Option : **un fichier par chapitre**, donc un fichier par morceau quand le MKV a des chapitres.
+- en option, un **master Dolby `.atmos` (DAMF)**, qui s'ouvre dans le Dolby Atmos Renderer.
+
+Option : **un fichier par chapitre**, donc un fichier par morceau quand le MKV a des chapitres (ADM, 7.1.4 et `.atmos`).
+
+Pendant la conversion, l'appli affiche une barre de progression globale avec le temps restant estimé, et un journal de chaque étape. Le journal est aussi enregistré dans `journal.txt`, dans le dossier de sortie : c'est le fichier à envoyer si quelque chose plante.
 
 ## Installer
 

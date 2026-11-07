@@ -380,8 +380,8 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Toggle("ADM BWF (objets Atmos, pour Virtuoso, Pro Tools, Dolby Renderer)", isOn: $conv.makeADM)
                     Toggle("WAV 7.1.4 (rendu canaux, se lit partout)", isOn: $conv.make714)
-                    Toggle("Un fichier par chapitre (un morceau = un fichier)", isOn: $conv.splitChapters)
-                    Toggle("Garder aussi le master Dolby brut (DAMF)", isOn: $conv.keepDAMF)
+                    Toggle("Un fichier par chapitre (un morceau = un fichier, .atmos compris)", isOn: $conv.splitChapters)
+                    Toggle("Master Dolby .atmos (DAMF) : s'ouvre dans le Dolby Renderer", isOn: $conv.keepDAMF)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(4)
